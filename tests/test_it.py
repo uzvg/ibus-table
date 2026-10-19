@@ -344,15 +344,19 @@ def set_default_settings() -> None:
     user_keybindings={}
     ENGINE.set_keybindings(user_keybindings, update_gsettings=False)
 
-    # Get more verbose output in the test log:
-    ENGINE.set_debug_level(255)
+    # Get more verbose output in the test log. Do not write this to
+    # GSettings, that would leave debug mode enabled for the real
+    # engines after running the tests:
+    ENGINE.set_debug_level(255, update_gsettings=False)
 # pylint: enable=too-many-branches
 
-def set_up(engine_name: str) -> bool:
+def set_up(engine_name: str, db_file: str = '') -> bool:
     '''
     Setup an ibus table engine
 
     :param engine_name: The name of the engine to setup
+    :param db_file: Optional path of the system database to use. If
+        empty, the installed database for “engine_name” is used.
     :return: True if the engine could be setup successfully, False if not.
     '''
     global TABSQLITEDB
@@ -378,8 +382,9 @@ def set_up(engine_name: str) -> bool:
     importlib.reload(table)
     sys.path.pop(0)
     bus = IBus.Bus()
-    db_dir = '/usr/share/ibus-table/tables'
-    db_file = os.path.join(db_dir, engine_name + '.db')
+    if not db_file:
+        db_dir = '/usr/share/ibus-table/tables'
+        db_file = os.path.join(db_dir, engine_name + '.db')
     if not os.path.isfile(db_file):
         TABSQLITEDB = None
         ENGINE = None
@@ -2350,6 +2355,92 @@ class SelectWordsEscapeIndexTestCase(unittest.TestCase):
         without_index_pages = self._real_db.execute(
             'PRAGMA page_count').fetchone()[0]
         self.assertLess(without_index_pages, with_index_pages)
+
+class FiveCodePrefixTestCase(unittest.TestCase):
+    '''Regression tests for tables where a shorter code is a prefix of a
+    longer code.
+
+    In ZhengMa, for example, 2-character phrases use 4 codes and
+    3-character phrases use 5 codes. The 4 codes of a 3-character
+    phrase are also a prefix of its 5 codes. Typing the 5th code must
+    extend the previous input, it must not commit the candidate for the
+    4-code prefix first. Conversely, typing a key which does not extend
+    a complete 4-code phrase must commit that phrase and use the key as
+    the start of a new composition.
+    '''
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.mkdtemp(prefix='ibus_table_five_code_test_')
+        db_path = os.path.join(self._tmpdir, 'fivecodetest.db')
+        con = sqlite3.connect(db_path)
+        con.execute('CREATE TABLE ime (attr TEXT, val TEXT)')
+        con.executemany('INSERT INTO ime VALUES (?,?)', [
+            ('max_key_length', '5'),
+            ('serial_number', '1'),
+            ('name', 'fivecodetest'),
+            ('languages', 'zh_CN'),
+            ('user_can_define_phrase', 'true'),
+            ('rules',
+             ('ce2:p11+p12+p21+p22;ce3:p11+p21+p22+p31+p32;'
+              'ce4:p11+p21+p31+p41+p42;ca5:p11+p21+p31+p41+p51')),
+            ('start_chars', 'abcdefghijklmnopqrstuvwxyz'),
+            ('auto_wildcard', 'true'),
+            ('dynamic_adjust', 'true'),
+            ('pinyin_mode', 'false'),
+            ('suggestion_mode', 'false'),
+            ('def_full_width_punct', 'false'),
+            ('def_full_width_letter', 'false'),
+        ])
+        con.execute(
+            'CREATE TABLE phrases (id INTEGER PRIMARY KEY, tabkeys TEXT,'
+            ' phrase TEXT, freq INTEGER, user_freq INTEGER)')
+        con.executemany(
+            'INSERT INTO phrases (tabkeys,phrase,freq,user_freq) '
+            'VALUES (?,?,?,?)',
+            [('aaeu', '四码', 100, 0),
+             ('aaeug', '五码', 200, 0),
+             ('jcwg', '国家', 300, 0),
+             ('x', '对', 1, 0)])
+        con.execute('CREATE TABLE goucima (zi TEXT PRIMARY KEY, goucima TEXT)')
+        con.executemany(
+            'INSERT INTO goucima (zi,goucima) VALUES (?,?)',
+            [('四', 'aa'), ('码', 'aa'), ('五', 'aa'),
+             ('国', 'jc'), ('家', 'wg'), ('对', 'xd')])
+        con.commit()
+        con.close()
+        if not set_up('fivecodetest', db_file=db_path):
+            self.skipTest('Could not setup “fivecodetest”, skipping test.')
+
+    def tearDown(self) -> None:
+        tear_down()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_five_code_phrase_is_not_committed_at_four_codes(self) -> None:
+        assert ENGINE is not None
+        for key in (IBus.KEY_a, IBus.KEY_a, IBus.KEY_e, IBus.KEY_u):
+            ENGINE._do_process_key_event(key, 0, 0)
+        self.assertEqual(ENGINE._chars_valid, 'aaeu')
+        self.assertEqual(ENGINE.mock_committed_text, '')
+        ENGINE._do_process_key_event(IBus.KEY_g, 0, 0)
+        self.assertEqual(ENGINE._chars_valid, 'aaeug')
+        self.assertEqual(ENGINE.mock_committed_text, '')
+        self.assertEqual(
+            [candidate[1] for candidate in ENGINE._candidates],
+            ['五码'])
+        ENGINE._do_process_key_event(IBus.KEY_space, 0, 0)
+        self.assertEqual(ENGINE.mock_committed_text, '五码')
+
+    def test_four_code_phrase_then_next_character(self) -> None:
+        assert ENGINE is not None
+        for key in (IBus.KEY_j, IBus.KEY_c, IBus.KEY_w, IBus.KEY_g):
+            ENGINE._do_process_key_event(key, 0, 0)
+        self.assertEqual(ENGINE._chars_valid, 'jcwg')
+        ENGINE._do_process_key_event(IBus.KEY_x, 0, 0)
+        self.assertEqual(ENGINE._chars_valid, 'x')
+        self.assertEqual(ENGINE._chars_invalid, '')
+        self.assertEqual(ENGINE.mock_preedit_text, '国家对')
+        ENGINE._do_process_key_event(IBus.KEY_space, 0, 0)
+        self.assertEqual(ENGINE.mock_committed_text, '国家对')
+
 
 if __name__ == '__main__':
     LOG_HANDLER = logging.StreamHandler(stream=sys.stderr)

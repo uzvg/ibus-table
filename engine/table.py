@@ -4183,16 +4183,15 @@ class TabEngine(IBus.EngineSimple):
                     else:
                         self.commit_to_preedit()
             elif self._input_mode and not self._py_mode:
-                if ((len(self._chars_valid)
-                     == self._max_key_length)
-                        or (len(self._chars_valid)
-                            in self.database.possible_tabkeys_lengths)):
+                if len(self._chars_valid) == self._max_key_length:
                     if self._auto_commit:
                         self.commit_everything_unless_invalid()
                     else:
                         self.commit_to_preedit()
             else:
                 assert False
+            chars_valid_before = self._chars_valid
+            chars_invalid_before = self._chars_invalid
             res = self.add_input(keychar)
             if not res:
                 if self._auto_select and self._candidates_previous:
@@ -4221,6 +4220,26 @@ class TabEngine(IBus.EngineSimple):
                     self.pop_input()
                     self.commit_everything_unless_invalid()
                     return self._table_mode_process_key_event(key)
+                if (not self._py_mode
+                        and not chars_invalid_before
+                        and len(chars_valid_before)
+                        in self.database.possible_tabkeys_lengths):
+                    # The key just typed does not extend the previous
+                    # complete code. Commit the previous candidate and
+                    # process this key again as the start of a new
+                    # composition. Do this only after trying to extend
+                    # the input above, otherwise tables where a shorter
+                    # code is a prefix of a longer one (for example
+                    # ZhengMa, where 4-code phrases are prefixes of
+                    # 5-code phrases) can never reach the longer code.
+                    self.pop_input()
+                    if self._candidates:
+                        if self._auto_commit:
+                            self.commit_everything_unless_invalid()
+                        else:
+                            self.commit_to_preedit()
+                        return self._table_mode_process_key_event(key)
+                    self.add_input(keychar)
                 self.commit_everything_unless_invalid()
                 self._update_ui()
                 return True
